@@ -6,11 +6,10 @@ package com.lwansbrough.RCTCamera;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.view.Surface;
 import android.hardware.Camera;
+import android.media.CamcorderProfile;
 import android.media.MediaActionSound;
 import android.media.MediaRecorder;
-import android.media.CamcorderProfile;
 import android.net.Uri;
 import android.os.Environment;
 import android.os.AsyncTask;
@@ -57,10 +56,10 @@ public class RCTCameraModule extends ReactContextBaseJavaModule implements Media
     public static final int MEDIA_TYPE_VIDEO = 2;
 
     private final ReactApplicationContext _reactContext;
-    private MediaRecorder mMediaRecorder;
-    private Promise mVideoPromise;
+    private MediaRecorder mMediaRecorder = null;
+    private Promise mVideoPromise = null;
+    private Camera mCamera = null;
     private String mVideoDestinationUri;
-    private Camera mCamera;
 
     public RCTCameraModule(ReactApplicationContext reactContext) {
         super(reactContext);
@@ -170,189 +169,196 @@ public class RCTCameraModule extends ReactContextBaseJavaModule implements Media
         });
     }
 
+    protected void capturePicture(final ReadableMap options, RCTCamera rCamera, final Promise promise) {
+        if (options.getBoolean("playSoundOnCapture")) {
+            MediaActionSound sound = new MediaActionSound();
+            sound.play(MediaActionSound.SHUTTER_CLICK);
+        }
+
+        rCamera.setCaptureQuality(options.getInt("type"), options.getString("quality"));
+        mCamera.takePicture(null, null, new Camera.PictureCallback() {
+            @Override
+            public void onPictureTaken(byte[] data, Camera camera) {
+                mCamera.stopPreview();
+                mCamera.startPreview();
+                switch (options.getInt("target")) {
+                    case RCT_CAMERA_CAPTURE_TARGET_MEMORY:
+                        String encoded = Base64.encodeToString(data, Base64.DEFAULT);
+                        promise.resolve(encoded);
+                        break;
+                    case RCT_CAMERA_CAPTURE_TARGET_CAMERA_ROLL:
+                        BitmapFactory.Options bitmapOptions = new BitmapFactory.Options();
+                        Bitmap bitmap = BitmapFactory.decodeByteArray(data, 0, data.length, bitmapOptions);
+                        String url = MediaStore.Images.Media.insertImage(
+                                _reactContext.getContentResolver(),
+                                bitmap, options.getString("title"),
+                                options.getString("description"));
+                        promise.resolve(url);
+                        break;
+                    case RCT_CAMERA_CAPTURE_TARGET_DISK:
+                        File pictureFile = getOutputMediaFile(MEDIA_TYPE_IMAGE);
+                        if (pictureFile == null) {
+                            promise.reject("Error creating media file.");
+                            return;
+                        }
+
+                        try {
+                            FileOutputStream fos = new FileOutputStream(pictureFile);
+                            fos.write(data);
+                            fos.close();
+                        } catch (FileNotFoundException e) {
+                            promise.reject("File not found: " + e.getMessage());
+                        } catch (IOException e) {
+                            promise.reject("Error accessing file: " + e.getMessage());
+                        }
+                        promise.resolve(Uri.fromFile(pictureFile).toString());
+                        break;
+                    case RCT_CAMERA_CAPTURE_TARGET_TEMP:
+                        File tempFile = getTempMediaFile(MEDIA_TYPE_IMAGE);
+
+                        if (tempFile == null) {
+                            promise.reject("Error creating media file.");
+                            return;
+                        }
+
+                        try {
+                            FileOutputStream fos = new FileOutputStream(tempFile);
+                            fos.write(data);
+                            fos.close();
+                        } catch (FileNotFoundException e) {
+                            promise.reject("File not found: " + e.getMessage());
+                        } catch (IOException e) {
+                            promise.reject("Error accessing file: " + e.getMessage());
+                        }
+                        promise.resolve(Uri.fromFile(tempFile).toString());
+                        break;
+                }
+            }
+        });
+    }
+
+    protected void captureVideo(ReadableMap options, RCTCamera rCamera, Promise promise) {
+        // Get the video destination
+        File destination;
+        switch (options.getInt("target")) {
+            case RCT_CAMERA_CAPTURE_TARGET_DISK:
+                destination = getOutputMediaFile(MEDIA_TYPE_VIDEO);
+                break;
+            case RCT_CAMERA_CAPTURE_TARGET_TEMP:
+            default:
+                destination = getTempMediaFile(MEDIA_TYPE_VIDEO);
+                break;
+        }
+
+        // Store promise, camera and file location for later
+        mVideoPromise = promise;
+        mVideoDestinationUri = Uri.fromFile(destination).toString();
+
+        // Try a hack for samsung HQ, didn't help (http://stackoverflow.com/questions/7225571/camcorderprofile-quality-high-resolution-produces-green-flickering-video)
+        // Camera.Parameters parameters = mCamera.getParameters();
+        // Camera.Size previewSize = parameters.getPreviewSize();
+        // parameters.set("cam_mode", 1);
+        // parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_INFINITY);
+        // mCamera.setParameters(parameters);
+
+        // Setup media recorder (watch out with modifying these options, the order is important!)
+        // @see http://developer.android.com/guide/topics/media/camera.html#capture-video
+        mMediaRecorder = new MediaRecorder();
+        // Attach callback to handle maxDuration (@see onInfo method in this file)
+        mMediaRecorder.setOnInfoListener(this);
+        mMediaRecorder.setCamera(mCamera);
+        mCamera.unlock();
+
+        // Set AV sources
+        mMediaRecorder.setAudioSource(MediaRecorder.AudioSource.CAMCORDER);
+        mMediaRecorder.setVideoSource(MediaRecorder.VideoSource.CAMERA);
+
+        // Set orientation hit
+        int orientation = rCamera.getCorrectCameraOrientation(options.getInt("type"));
+        mMediaRecorder.setOrientationHint(orientation);
+        // Create a profile
+        int quality;
+        switch (options.getString("quality")) {
+            case "low":
+                quality = CamcorderProfile.QUALITY_LOW; // select the lowest res
+                break;
+            case "medium":
+                quality = CamcorderProfile.QUALITY_720P; // select medium
+                break;
+            case "high":
+                quality = CamcorderProfile.QUALITY_HIGH; // select the highest res (default)
+                break;
+            default:
+                releaseMediaRecorder();
+                promise.reject("No valid quality option given");
+                return;
+        }
+        CamcorderProfile profile = CamcorderProfile.get(quality);
+        // Modify profile
+        // profile.fileFormat = MediaRecorder.OutputFormat.THREE_GPP;
+        profile.fileFormat = MediaRecorder.OutputFormat.MPEG_4;
+        profile.audioCodec = MediaRecorder.AudioEncoder.AMR_NB;
+        profile.videoCodec = MediaRecorder.VideoEncoder.H264;
+        // profile.videoBitRate = 15;
+        // profile.videoFrameRate = 30;
+        mMediaRecorder.setProfile(profile);
+        // Same as profile settings from above, do not use both at the same time
+        // mMediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+        // mMediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB);
+        // mMediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
+        // mMediaRecorder.setVideoEncodingBitRate(15);
+        // mMediaRecorder.setVideoFrameRate(30);
+        // mMediaRecorder.setAudioEncodingBitRate(50000);
+
+        mMediaRecorder.setOutputFile(destination.getAbsolutePath());
+
+        // Set maxDuration when given as option, didn't seem to work when passed in to the profile
+        // On my devices, maxDuration couln't be less than 4 seconds
+        if (options.hasKey("totalSeconds")) {
+            int totalSeconds = options.getInt("totalSeconds");
+            // @todo not sure if this is the case on all platforms:
+            if (totalSeconds < 4) {
+                totalSeconds = 4;
+            }
+            mMediaRecorder.setMaxDuration(totalSeconds * 1000);
+        }
+        mMediaRecorder.setMaxFileSize(100 * 1000 * 1000); // = 100 MB
+
+        try {
+            // prepare and start recording
+            mMediaRecorder.prepare();
+        } catch (IllegalStateException e) {
+            Log.e(TAG, "IllegalStateException: " + e.getMessage());
+            releaseMediaRecorder();
+            promise.reject("IllegalStateException: " + e.getMessage());
+        } catch (IOException e) {
+            Log.e(TAG, "IOException: " + e.getMessage());
+            releaseMediaRecorder();
+            promise.reject("IOException: " + e.getMessage());
+        }
+        // Start the recording in the background (@see RecordVideoTask down below)
+        // new RecordVideoTask().execute(null, null, null);
+        mMediaRecorder.start();
+    }
+
     public void onInfo(MediaRecorder mr, int what, int extra) {
         if (
             what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED ||
             what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED
         ) {
-            Log.v(TAG, "MEDIAENCODER_RESOLVE");
-            if (mVideoPromise != null) {
-                mVideoPromise.resolve(mVideoDestinationUri);
-                mVideoPromise = null;
-            }
+            releaseMediaRecorder();
         }
     }
 
-    @ReactMethod
-    public void capture(final ReadableMap options, final Promise promise) {
-        RCTCamera rCamera = RCTCamera.getInstance();
-        Camera camera = rCamera.acquireCameraInstance(options.getInt("type"));
-        if (null == camera) {
-            promise.reject("No camera found.");
-            return;
-        }
+    // class RecordVideoTask extends AsyncTask<Void, Void, Boolean> {
+    //     @Override
+    //     protected Boolean doInBackground(Void... voids) {
+    //         mMediaRecorder.start();
+    //         return true;
+    //     }
+    // }
 
-        if (options.getInt("mode") == RCT_CAMERA_CAPTURE_MODE_VIDEO) {
-            // Get the video destination (temp file only at the moment)
-            final File destination = getTempMediaFile(MEDIA_TYPE_VIDEO);
-            // Store promise, camera and file location for later
-            mVideoPromise = promise;
-            mCamera = camera;
-            mVideoDestinationUri = Uri.fromFile(destination).toString();
-
-            // Try a hack for samsung HQ, didn't help (http://stackoverflow.com/questions/7225571/camcorderprofile-quality-high-resolution-produces-green-flickering-video)
-            // parameters.set("cam_mode", 1);
-            // parameters.setFocusMode(Camera.Parameters.FOCUS_MODE_INFINITY);
-            // camera.setParameters(parameters);
-
-            // Grab size from camera instance
-            Camera.Parameters parameters = camera.getParameters();
-            Camera.Size previewSize = parameters.getPreviewSize();
-
-            // Create a profile (HQ for now)
-            CamcorderProfile profile = CamcorderProfile.get(CamcorderProfile.QUALITY_HIGH);
-            // Modify profile
-            profile.fileFormat = MediaRecorder.OutputFormat.THREE_GPP;
-            // profile.fileFormat = MediaRecorder.OutputFormat.MPEG_4;
-            profile.audioCodec = MediaRecorder.AudioEncoder.AMR_NB;
-            profile.videoCodec = MediaRecorder.VideoEncoder.H264;
-            profile.videoBitRate = 15;
-            profile.videoFrameRate = 30;
-            profile.videoFrameWidth = 720; // previewSize.width;
-            profile.videoFrameHeight = 480; // previewSize.height;
-
-            // Setup media recorder (watch out with modifying these options, the order is important!)
-            // @see http://developer.android.com/guide/topics/media/camera.html#capture-video
-            mMediaRecorder = new MediaRecorder();
-            camera.unlock();
-            mMediaRecorder.setCamera(camera);
-            mMediaRecorder.setAudioSource(MediaRecorder.AudioSource.DEFAULT);
-            mMediaRecorder.setVideoSource(MediaRecorder.VideoSource.CAMERA);
-
-            mMediaRecorder.setProfile(profile);
-            // Same as profile settings from above, do not use both at the same time
-            // mMediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
-            // mMediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB);
-            // mMediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
-            // mMediaRecorder.setVideoEncodingBitRate(15);
-            // mMediaRecorder.setVideoFrameRate(30);
-            // mMediaRecorder.setVideoSize(previewSize.width, previewSize.height);
-            // mMediaRecorder.setAudioEncodingBitRate(50000);
-
-            mMediaRecorder.setOutputFile(destination.getAbsolutePath());
-
-            // Attach callback to handle maxDuration (@see onInfo method in this file)
-            mMediaRecorder.setOnInfoListener(this);
-
-            // Set maxDuration when given as option, didn't seem to work when passed in to the profile
-            // On my devices, maxDuration couln't be less than 4 seconds
-            if (options.hasKey("totalSeconds")) {
-                int totalSeconds = options.getInt("totalSeconds");
-                // @todo not sure if this is the case on all platforms:
-                // if (totalSeconds < 4) {
-                //   promise.reject("Duration cannot be less than 4 seconds");
-                // }
-                mMediaRecorder.setMaxDuration(totalSeconds * 1000);
-            }
-            // @todo setPreviewDisplay is documented as "optional", but I suspect it of being the cause of the resulting video not being playable.
-            // (on my Nexus 7 and Samsung Galaxy S4 Mini)
-            // I have tried getting access to the SurfaceTexture, and passing it in a seen below, that didn't yield any results (compiled fine, no playable video).
-            // mMediaRecorder.setPreviewDisplay(new Surface(rCamera.getPreviewSurfaceTexture()));
-
-            try {
-                // prepare and start recording
-                mMediaRecorder.prepare();
-            } catch (IllegalStateException e) {
-                Log.e(TAG, "IllegalStateException: " + e.getMessage());
-                _stopCapture();
-                promise.reject("IllegalStateException: " + e.getMessage());
-            } catch (IOException e) {
-                Log.e(TAG, "IOException: " + e.getMessage());
-                _stopCapture();
-                promise.reject("IOException: " + e.getMessage());
-            }
-            // Start the recording in the background (@see RecordVideoTask down below)
-            new RecordVideoTask().execute(null, null, null);
-        }
-
-        if (options.getInt("mode") == RCT_CAMERA_CAPTURE_MODE_STILL) {
-            if (options.getBoolean("playSoundOnCapture")) {
-                MediaActionSound sound = new MediaActionSound();
-                sound.play(MediaActionSound.SHUTTER_CLICK);
-            }
-
-            rCamera.setCaptureQuality(options.getInt("type"), options.getString("quality"));
-            camera.takePicture(null, null, new Camera.PictureCallback() {
-                @Override
-                public void onPictureTaken(byte[] data, Camera camera) {
-                    camera.stopPreview();
-                    camera.startPreview();
-                    switch (options.getInt("target")) {
-                        case RCT_CAMERA_CAPTURE_TARGET_MEMORY:
-                            String encoded = Base64.encodeToString(data, Base64.DEFAULT);
-                            promise.resolve(encoded);
-                            break;
-                        case RCT_CAMERA_CAPTURE_TARGET_CAMERA_ROLL:
-                            BitmapFactory.Options bitmapOptions = new BitmapFactory.Options();
-                            Bitmap bitmap = BitmapFactory.decodeByteArray(data, 0, data.length, bitmapOptions);
-                            String url = MediaStore.Images.Media.insertImage(
-                                    _reactContext.getContentResolver(),
-                                    bitmap, options.getString("title"),
-                                    options.getString("description"));
-                            promise.resolve(url);
-                            break;
-                        case RCT_CAMERA_CAPTURE_TARGET_DISK:
-                            File pictureFile = getOutputMediaFile(MEDIA_TYPE_IMAGE);
-                            if (pictureFile == null) {
-                                promise.reject("Error creating media file.");
-                                return;
-                            }
-
-                            try {
-                                FileOutputStream fos = new FileOutputStream(pictureFile);
-                                fos.write(data);
-                                fos.close();
-                            } catch (FileNotFoundException e) {
-                                promise.reject("File not found: " + e.getMessage());
-                            } catch (IOException e) {
-                                promise.reject("Error accessing file: " + e.getMessage());
-                            }
-                            promise.resolve(Uri.fromFile(pictureFile).toString());
-                            break;
-                        case RCT_CAMERA_CAPTURE_TARGET_TEMP:
-                            File tempFile = getTempMediaFile(MEDIA_TYPE_IMAGE);
-
-                            if (tempFile == null) {
-                                promise.reject("Error creating media file.");
-                                return;
-                            }
-
-                            try {
-                                FileOutputStream fos = new FileOutputStream(tempFile);
-                                fos.write(data);
-                                fos.close();
-                            } catch (FileNotFoundException e) {
-                                promise.reject("File not found: " + e.getMessage());
-                            } catch (IOException e) {
-                                promise.reject("Error accessing file: " + e.getMessage());
-                            }
-                            promise.resolve(Uri.fromFile(tempFile).toString());
-                            break;
-                    }
-                }
-            });
-        }
-    }
-
-    class RecordVideoTask extends AsyncTask<Void, Void, Boolean> {
-        @Override
-        protected Boolean doInBackground(Void... voids) {
-            mMediaRecorder.start();
-            return true;
-        }
-    }
-
-    public void _stopCapture() {
+    public void releaseMediaRecorder() {
         if (mMediaRecorder != null) {
             mMediaRecorder.setOnInfoListener(null);
             mMediaRecorder.stop();
@@ -362,14 +368,45 @@ public class RCTCameraModule extends ReactContextBaseJavaModule implements Media
         }
         if (mCamera != null) {
             mCamera.lock();
+            mCamera = null;
         }
-        mVideoPromise.resolve(mVideoDestinationUri);
+        if (mVideoPromise != null) {
+            mVideoPromise.resolve(mVideoDestinationUri);
+            mVideoPromise = null;
+        }
+    }
+
+    @ReactMethod
+    public void capture(ReadableMap options, Promise promise) {
+        RCTCamera rCamera = RCTCamera.getInstance();
+        Camera camera = rCamera.acquireCameraInstance(options.getInt("type"));
+        if (null == camera) {
+            promise.reject("No camera found.");
+            return;
+        }
+        mCamera = camera;
+
+        String qualityOption = options.getString("quality");
+        rCamera.setCaptureQuality(options.getInt("type"), qualityOption);
+
+        if (options.getInt("mode") == RCT_CAMERA_CAPTURE_MODE_VIDEO) {
+            captureVideo(options, rCamera, promise);
+            return;
+        }
+
+        if (options.getInt("mode") == RCT_CAMERA_CAPTURE_MODE_STILL) {
+            capturePicture(options, rCamera, promise);
+            return;
+        }
+
+        promise.reject("Unable to find given capture mode");
+        return;
     }
 
     @ReactMethod
     public void stopCapture(final Promise promise) {
-        _stopCapture();
-        promise.resolve(null);
+        releaseMediaRecorder();
+        promise.resolve("Stopped capture");
     }
 
     @ReactMethod
